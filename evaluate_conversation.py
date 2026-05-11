@@ -83,26 +83,45 @@ def build_jog_synthetic_data(
 ) -> tuple[List[str], List[List[str]], List[str]]:
     """
     Build synthetic questions and per-turn context lists mirroring the
-    JOG eval.py experiment (arXiv:2406.13356).
+    JOG eval.py experiment exactly (arXiv:2406.13356).
 
-    At each turn t, the context prepended to the question contains t randomly
-    sampled names from names_file. At turn 0 the context is empty (tests
-    parametric knowledge alone).
+    The JOG prompt format is:
+        "[name1] [name2] ... [nameK] [first_target_name]"
+    where the model is expected to complete with the second part of the target.
+
+    Example: "James John Robert Anthony" → model should output "Mark"
+    (target = "Anthony Mark", question = "Anthony", context = "James John Robert")
+
+    At turn 0 the context is empty (parametric-only test).
+    At turn t, the context contains t randomly sampled names from names_file,
+    space-separated, mirroring how the JOG attack injects related names.
+
+    Note: pass context_sep=" " to compute_turn_metrics for this data.
 
     Returns:
-        questions   : list of n_samples question strings
-        turn_contexts: list of (max_turns+1) lists, each with n_samples
-                       context strings for that turn
+        questions   : list of n_samples strings — just the first target name
+        turn_contexts: list of (max_turns+1) context lists (one per turn)
         ground_truths: list of n_samples ground-truth answers (all = target)
     """
     rng = random.Random(seed)
-    names = _load_lines(names_file)
+
+    # Parse names_file: split all whitespace-separated tokens, exclude target words
+    target_parts = set(target.lower().split())
+    raw_tokens = []
+    for line in _load_lines(names_file):
+        raw_tokens.extend(line.split())
+    names = [t for t in raw_tokens if t.lower() not in target_parts]
+    # Deduplicate while preserving order
+    seen: set = set()
+    unique_names: List[str] = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            unique_names.append(n)
+    names = unique_names
 
     first_name = target.split()[0]
-    questions = [
-        f"Complete the following: {first_name}"
-        for _ in range(n_samples)
-    ]
+    questions = [first_name] * n_samples
     ground_truths = [target] * n_samples
 
     turn_contexts: List[List[str]] = []
@@ -112,9 +131,9 @@ def build_jog_synthetic_data(
         else:
             contexts = []
             for _ in range(n_samples):
-                sampled = rng.sample(names, min(turn, len(names)))
-                ctx = "Related names: " + ", ".join(sampled) + "."
-                contexts.append(ctx)
+                k = rng.randrange(max(1, min(turn, len(names))))
+                sampled = rng.sample(names, k)
+                contexts.append(" ".join(sampled))
             turn_contexts.append(contexts)
 
     return questions, turn_contexts, ground_truths
@@ -243,6 +262,9 @@ def parse_args() -> argparse.Namespace:
     syn.add_argument("--n_samples", type=int, default=100)
     syn.add_argument("--max_turns", type=int, default=10)
     syn.add_argument("--seed", type=int, default=42)
+    syn.add_argument("--context_sep", default=None,
+                     help="Override context/question separator. Defaults to ' ' "
+                          "for JOG mode and '\\n' for explicit/demo mode.")
 
     # Explicit data mode
     exp = p.add_argument_group("Explicit data files")
@@ -257,12 +279,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # ---- Determine data source ----
+    # ---- Determine data source and context separator ----
     if args.questions and args.answers and args.context_dir:
         print("Loading explicit question/answer/context data...")
         questions, turn_contexts, ground_truths = load_explicit_data(
             args.questions, args.answers, args.context_dir
         )
+        context_sep = args.context_sep if args.context_sep is not None else "\n"
     elif args.names_file:
         if not os.path.exists(args.names_file):
             sys.exit(f"Names file not found: {args.names_file}")
@@ -274,6 +297,8 @@ def main() -> None:
             max_turns=args.max_turns,
             seed=args.seed,
         )
+        # JOG prompts are space-joined: "[names] Anthony"
+        context_sep = args.context_sep if args.context_sep is not None else " "
     else:
         # Demo: tiny self-contained example that runs without any data files
         print("No data source specified — running a self-contained demo.")
@@ -297,6 +322,7 @@ def main() -> None:
             ],
         ]
         ground_truths = ["J.K. Rowling", "Paris", "Einstein"]
+        context_sep = args.context_sep if args.context_sep is not None else "\n"
 
     print(f"Loading model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -327,6 +353,7 @@ def main() -> None:
             turn=turn,
             max_new_tokens=args.max_new_tokens,
             device=args.device,
+            context_sep=context_sep,
         )
         results.append(result)
         print(f"PPR={result.ppr:.3f}  KIR={result.kir:.3f}  CtxAcc={result.contextual_accuracy:.3f}")
