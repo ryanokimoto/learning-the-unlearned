@@ -159,6 +159,7 @@ def compute_kir(
     max_new_tokens: int = 64,
     device: str = "cuda",
     answer_fn: Optional[Callable[[str, str], bool]] = None,
+    context_sep: str = "\n",
 ) -> float:
     """
     Knowledge Integration Rate: fraction of questions where the provided
@@ -179,6 +180,7 @@ def compute_kir(
         max_new_tokens: Generation budget.
         device: Torch device string.
         answer_fn: Optional custom match(response, ground_truth) -> bool.
+        context_sep: Separator between context and question in the prompt.
 
     Returns:
         KIR as a float in [0, 1].
@@ -187,7 +189,7 @@ def compute_kir(
     kir_count = 0
     for q, ctx, gt in zip(questions, contexts, ground_truths):
         param_resp = _generate(model, tokenizer, q, max_new_tokens, device)
-        ctx_prompt = f"{ctx}\n{q}".strip() if ctx else q
+        ctx_prompt = f"{ctx}{context_sep}{q}".strip() if ctx else q
         ctx_resp = _generate(model, tokenizer, ctx_prompt, max_new_tokens, device)
         if not match(param_resp, gt) and match(ctx_resp, gt):
             kir_count += 1
@@ -204,6 +206,7 @@ def compute_turn_metrics(
     max_new_tokens: int = 64,
     device: str = "cuda",
     answer_fn: Optional[Callable[[str, str], bool]] = None,
+    context_sep: str = "\n",
 ) -> TurnResult:
     """
     Compute PPR and KIR jointly for a single conversation turn, avoiding
@@ -222,6 +225,9 @@ def compute_turn_metrics(
         max_new_tokens: Generation budget.
         device: Torch device string.
         answer_fn: Optional custom match(response, ground_truth) -> bool.
+        context_sep: Separator placed between context and question when
+            assembling the contextual prompt. Use " " for JOG-style name
+            lists; use "\\n" for chat-style conversation history.
 
     Returns:
         TurnResult with PPR, KIR, and raw counts.
@@ -232,7 +238,7 @@ def compute_turn_metrics(
 
     for q, ctx, gt in zip(questions, contexts, ground_truths):
         param_resp = _generate(model, tokenizer, q, max_new_tokens, device)
-        ctx_prompt = f"{ctx}\n{q}".strip() if ctx else q
+        ctx_prompt = f"{ctx}{context_sep}{q}".strip() if ctx else q
         ctx_resp = _generate(model, tokenizer, ctx_prompt, max_new_tokens, device)
 
         p_ok = match(param_resp, gt)
