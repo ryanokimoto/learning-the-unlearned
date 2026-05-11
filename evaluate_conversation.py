@@ -253,6 +253,10 @@ def parse_args() -> argparse.Namespace:
         description="Evaluate PPR and KIR across conversation turns."
     )
     p.add_argument("--model", required=True, help="HuggingFace model name or local path")
+    p.add_argument("--tokenizer", default=None,
+                   help="Tokenizer to use if different from --model (e.g. load weights "
+                        "from a fine-tuned checkpoint but tokenizer from the base model). "
+                        "Defaults to --model if not set.")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--max_new_tokens", type=int, default=64)
     p.add_argument("--output_csv", default=None, help="Optional path to write CSV results")
@@ -328,8 +332,11 @@ def main() -> None:
         ground_truths = ["J.K. Rowling", "Paris", "Einstein"]
         context_sep = args.context_sep if args.context_sep is not None else "\n"
 
+    tokenizer_src = args.tokenizer or args.model
     print(f"Loading model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer_src != args.model:
+        print(f"Loading tokenizer from: {tokenizer_src}")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_src, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
