@@ -90,7 +90,7 @@ def _generate(
         prompt,
         return_tensors="pt",
         truncation=True,
-        max_length=512,
+        max_length=None,
         padding=False,
     ).to(device)
     with torch.no_grad():

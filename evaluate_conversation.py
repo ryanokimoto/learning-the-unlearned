@@ -58,12 +58,16 @@ import random
 import sys
 from pathlib import Path
 from typing import List, Optional
+import warnings
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from metrics.ppr_kir import TurnResult, compute_turn_metrics
 
+
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 
 # ---------------------------------------------------------------------------
 # Data helpers
