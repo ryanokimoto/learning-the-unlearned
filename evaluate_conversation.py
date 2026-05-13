@@ -371,8 +371,8 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.float16 if "cuda" in args.device else torch.float32,
-        device_map="auto" if "cuda" in args.device else None,
+        dtype=torch.float16 if "cuda" in args.device else torch.float32,
+        device_map=args.device if "cuda" in args.device else None,
     )
     model.eval()
 

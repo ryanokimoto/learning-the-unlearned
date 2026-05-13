@@ -42,6 +42,35 @@ class ItemScores:
 
 
 # ---------------------------------------------------------------------------
+# Device resolution
+# ---------------------------------------------------------------------------
+
+def _model_device(model, fallback: str = "cuda") -> torch.device:
+    """
+    Resolve the device tensors should be moved to.
+
+    With device_map="auto" (multi-GPU sharding), the model's embedding layer
+    may live on a non-zero GPU; passing inputs on cuda:0 produces a
+    cross-device error. We probe the actual embedding device when available,
+    falling back to the first parameter, then to the user-supplied string.
+    """
+    # Path 1: HF accelerate annotates layers with hf_device_map
+    dmap = getattr(model, "hf_device_map", None)
+    if dmap:
+        # Prefer the embedding entry; otherwise take any value.
+        for key in ("transformer.wte", "model.embed_tokens", "wte", "embed_tokens"):
+            if key in dmap:
+                return torch.device(dmap[key])
+        # Any device entry will do — inputs flow through whatever owns the embeddings.
+        return torch.device(next(iter(dmap.values())))
+    # Path 2: single-device model
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device(fallback)
+
+
+# ---------------------------------------------------------------------------
 # Log-probability scoring (the primary signal)
 # ---------------------------------------------------------------------------
 
@@ -90,14 +119,14 @@ def score_logprob(
         target_start = prompt_ids.shape[0]
         target_len = target_ids.shape[0]
 
-    input_ids = full_ids.unsqueeze(0).to(device)
+    input_ids = full_ids.unsqueeze(0).to(_model_device(model, device))
     logits = model(input_ids).logits[0]  # [seq_len, vocab]
 
     # Standard causal-LM shift: logits at position i predict token at i+1.
     # We want log P of tokens [target_start ... target_start+target_len-1],
     # which are predicted by logits at positions [target_start-1 ... target_start+target_len-2].
     pred_logits = logits[target_start - 1 : target_start - 1 + target_len]
-    target_ids = full_ids[target_start : target_start + target_len].to(device)
+    target_ids = full_ids[target_start : target_start + target_len].to(logits.device)
 
     log_probs = torch.log_softmax(pred_logits.float(), dim=-1)
     token_logps = log_probs.gather(1, target_ids.unsqueeze(1)).squeeze(1)
@@ -118,7 +147,7 @@ def generate(
     device: str = "cuda",
 ) -> str:
     """Greedy generation for the response side of substring-match scoring."""
-    enc = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
+    enc = tokenizer(prompt, return_tensors="pt", truncation=True).to(_model_device(model, device))
     out = model.generate(
         **enc,
         max_new_tokens=max_new_tokens,
