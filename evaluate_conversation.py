@@ -1,52 +1,41 @@
 """
-evaluate_conversation.py
+evaluate_conversation.py — Track PPR and KIR across conversation turns.
 
-Tracks PPR and KIR across the turns of a conversation to show how much
-parametric vs contextual knowledge the model uses as context accumulates.
+Major changes from v1:
 
-Compatible with the JOG synthetic experiment data format
-(jog_llm_memory/synthetic/eval.py, arXiv:2406.13356).
+  * Log-probability scoring by default (continuous signal, low variance).
+    Pass --use_generation to fall back to greedy generation + substring match.
 
-Usage
------
-# Minimal (auto-generates a JOG-style synthetic conversation):
-python evaluate_conversation.py --model shengyuanhu/common_names_7_repetition_relearn_8_17
+  * Oracle context is now a first-class input — required for paper-faithful
+    PPR. In JOG synthetic mode an oracle is built automatically by inserting
+    the gold answer into a short filler name list.
 
-# With explicit QA data and per-turn context files:
-python evaluate_conversation.py \
-    --model <model_name_or_path> \
-    --questions path/to/questions.txt \
-    --answers path/to/answers.txt \
-    --context_dir path/to/turn_contexts/   # turn_0.txt, turn_1.txt, ...
+  * The persistence probe (parametric-only scoring at each turn, used to
+    detect soft relearning across a *trajectory* of model checkpoints) is
+    available via --persistence_mode.
 
-# Specify number of synthetic turns and names per turn:
-python evaluate_conversation.py \
-    --model <model_name_or_path> \
-    --names_file jog_llm_memory/synthetic/common_names_ft.txt \
-    --target "Anthony Mark" \
-    --n_samples 100 \
-    --max_turns 10
+Usage examples
+--------------
+JOG synthetic data (recommended for the Hu et al. setting):
 
-Output
-------
-Per-turn table written to stdout and optionally to --output_csv.
+    python evaluate_conversation.py \\
+        --model shengyuanhu/common_names_7_repetition_relearn_8_17 \\
+        --names_file jog_llm_memory/synthetic/common_names_ft.txt \\
+        --target "Anthony Mark" \\
+        --n_samples 100 \\
+        --max_turns 10 \\
+        --output_csv results.csv
 
-  Turn | PPR   | KIR   | CtxAcc | PPR-only | KIR-only | Both | Neither
-  ---- | ----- | ----- | ------ | -------- | -------- | ---- | -------
-     0 | 0.120 | 0.000 | 0.120  |       12 |        0 |    0 |      88
-     1 | 0.120 | 0.080 | 0.200  |       12 |        8 |    0 |      80
-     ...
+Explicit question/answer/context files:
 
-Columns
--------
-  PPR     : Parametric Proxy Rate — fraction correct from weights alone
-  KIR     : Knowledge Integration Rate — fraction where context filled
-              a gap in parametric knowledge
-  CtxAcc  : Contextual accuracy (correct with context at this turn)
-  PPR-only: Both parametric and context correct (PPR contributes)
-  KIR-only: Parametric wrong, context correct (KIR event)
-  Both    : Here = parametric correct AND context correct (overlap count)
-  Neither : Wrong in both conditions
+    python evaluate_conversation.py \\
+        --model <path> \\
+        --questions q.txt --answers a.txt --context_dir ctx/ \\
+        --oracle_dir oracle_ctx/
+
+Tiny demo (no data files):
+
+    python evaluate_conversation.py --model gpt2 --demo
 """
 
 from __future__ import annotations
@@ -56,21 +45,23 @@ import csv
 import os
 import random
 import sys
-from pathlib import Path
-from typing import List, Optional
 import warnings
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from metrics.conditions import jog_oracle_context, natural_oracle_context
 from metrics.ppr_kir import TurnResult, compute_turn_metrics
 
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 
+
 # ---------------------------------------------------------------------------
-# Data helpers
+# Data loading
 # ---------------------------------------------------------------------------
 
 def _load_lines(path: str) -> List[str]:
@@ -84,38 +75,23 @@ def build_jog_synthetic_data(
     n_samples: int,
     max_turns: int,
     seed: int = 42,
-) -> tuple[List[str], List[List[str]], List[str]]:
+) -> Tuple[List[str], List[List[str]], List[List[str]], List[str]]:
     """
-    Build synthetic questions and per-turn context lists mirroring the
-    JOG eval.py experiment exactly (arXiv:2406.13356).
-
-    The JOG prompt format is:
-        "[name1] [name2] ... [nameK] [first_target_name]"
-    where the model is expected to complete with the second part of the target.
-
-    Example: "James John Robert Anthony" → model should output "Mark"
-    (target = "Anthony Mark", question = "Anthony", context = "James John Robert")
-
-    At turn 0 the context is empty (parametric-only test).
-    At turn t, the context contains t randomly sampled names from names_file,
-    space-separated, mirroring how the JOG attack injects related names.
-
-    Note: pass context_sep=" " to compute_turn_metrics for this data.
+    Build synthetic JOG-style data with oracle contexts.
 
     Returns:
-        questions   : list of n_samples strings — just the first target name
-        turn_contexts: list of (max_turns+1) context lists (one per turn)
-        ground_truths: list of n_samples ground-truth answers (all = target)
+        questions: n_samples copies of the first-name cue (e.g. "Anthony")
+        turn_hybrid_contexts: (max_turns+1) lists of n_samples context strings
+        turn_oracle_contexts: (max_turns+1) lists of n_samples oracle strings
+        gold_answers: n_samples copies of the target (e.g. "Anthony Mark")
     """
     rng = random.Random(seed)
 
-    # Parse names_file: split all whitespace-separated tokens, exclude target words
     target_parts = set(target.lower().split())
-    raw_tokens = []
+    raw_tokens: List[str] = []
     for line in _load_lines(names_file):
         raw_tokens.extend(line.split())
     names = [t for t in raw_tokens if t.lower() not in target_parts]
-    # Deduplicate while preserving order
     seen: set = set()
     unique_names: List[str] = []
     for n in names:
@@ -126,39 +102,50 @@ def build_jog_synthetic_data(
 
     first_name = target.split()[0]
     questions = [first_name] * n_samples
-    ground_truths = [target] * n_samples
+    gold_answers = [target] * n_samples
 
-    turn_contexts: List[List[str]] = []
+    turn_hybrid: List[List[str]] = []
+    turn_oracle: List[List[str]] = []
+
     for turn in range(max_turns + 1):
         if turn == 0:
-            turn_contexts.append([""] * n_samples)
+            turn_hybrid.append([""] * n_samples)
+            # Even at turn 0 we want an oracle for the PPR denominator.
+            turn_oracle.append([jog_oracle_context(target) for _ in range(n_samples)])
         else:
-            contexts = []
+            hybrid_t = []
+            oracle_t = []
             for _ in range(n_samples):
                 k = rng.randrange(max(1, min(turn, len(names))))
                 sampled = rng.sample(names, k)
-                contexts.append(" ".join(sampled))
-            turn_contexts.append(contexts)
+                hybrid_t.append(" ".join(sampled))
+                # Oracle for this turn matches the rough length of hybrid context
+                # but inserts the target answer.
+                oracle_filler = rng.sample(names, min(k, len(names)))
+                oracle_t.append(" ".join(oracle_filler + [target]))
+            turn_hybrid.append(hybrid_t)
+            turn_oracle.append(oracle_t)
 
-    return questions, turn_contexts, ground_truths
+    return questions, turn_hybrid, turn_oracle, gold_answers
 
 
 def load_explicit_data(
     questions_file: str,
     answers_file: str,
     context_dir: str,
-) -> tuple[List[str], List[List[str]], List[str]]:
+    oracle_dir: Optional[str] = None,
+) -> Tuple[List[str], List[List[str]], List[List[str]], List[str]]:
     """
-    Load questions, answers, and per-turn context files from disk.
+    Load questions, answers, per-turn hybrid contexts, and per-turn oracle contexts.
 
-    context_dir should contain files named turn_0.txt, turn_1.txt, etc.
-    Each file has one context string per line (one per question, same order).
-    turn_0.txt should contain only empty lines for the parametric-only baseline.
+    context_dir layout: turn_0.txt, turn_1.txt, ... — one context per line.
+    oracle_dir layout: same. If oracle_dir is None, a trivial oracle is built
+    from the gold answer for every item ("The answer is <gold>.").
     """
     questions = _load_lines(questions_file)
-    ground_truths = _load_lines(answers_file)
+    gold_answers = _load_lines(answers_file)
 
-    turn_contexts: List[List[str]] = []
+    turn_hybrid: List[List[str]] = []
     turn = 0
     while True:
         ctx_file = Path(context_dir) / f"turn_{turn}.txt"
@@ -168,15 +155,54 @@ def load_explicit_data(
             ctxs = [l.rstrip("\n") for l in f]
         if len(ctxs) != len(questions):
             raise ValueError(
-                f"{ctx_file} has {len(ctxs)} lines but questions has {len(questions)}"
+                f"{ctx_file} has {len(ctxs)} lines, expected {len(questions)}"
             )
-        turn_contexts.append(ctxs)
+        turn_hybrid.append(ctxs)
         turn += 1
-
-    if not turn_contexts:
+    if not turn_hybrid:
         raise FileNotFoundError(f"No turn_N.txt files found in {context_dir}")
 
-    return questions, turn_contexts, ground_truths
+    if oracle_dir:
+        turn_oracle: List[List[str]] = []
+        for t in range(len(turn_hybrid)):
+            oracle_file = Path(oracle_dir) / f"turn_{t}.txt"
+            if oracle_file.exists():
+                with open(oracle_file) as f:
+                    turn_oracle.append([l.rstrip("\n") for l in f])
+            else:
+                turn_oracle.append([natural_oracle_context(g) for g in gold_answers])
+    else:
+        # Synthesize a trivial oracle from the gold answer for every turn.
+        turn_oracle = [
+            [natural_oracle_context(g) for g in gold_answers]
+            for _ in range(len(turn_hybrid))
+        ]
+
+    return questions, turn_hybrid, turn_oracle, gold_answers
+
+
+def build_demo_data() -> Tuple[List[str], List[List[str]], List[List[str]], List[str]]:
+    """Self-contained demo data for sanity-checking the pipeline."""
+    questions = [
+        "The capital of France is",
+        "The largest planet in our solar system is",
+        "The author of Romeo and Juliet is",
+    ]
+    gold_answers = ["Paris", "Jupiter", "Shakespeare"]
+    turn_hybrid = [
+        ["", "", ""],                                                    # turn 0
+        ["France is in Europe.",                                         # turn 1
+         "Astronomers study planets.",
+         "He wrote plays in the 1500s."],
+        ["Paris is the largest city in France.",                         # turn 2
+         "Jupiter has many moons.",
+         "Shakespeare lived in Stratford."],
+    ]
+    turn_oracle = [
+        [natural_oracle_context(g) for g in gold_answers]
+        for _ in range(len(turn_hybrid))
+    ]
+    return questions, turn_hybrid, turn_oracle, gold_answers
 
 
 # ---------------------------------------------------------------------------
@@ -184,19 +210,20 @@ def load_explicit_data(
 # ---------------------------------------------------------------------------
 
 _HEADER = (
-    f"{'Turn':>4} | {'PPR':>6} | {'KIR':>6} | {'CtxAcc':>6} | "
-    f"{'P-only':>6} | {'KIR':>6} | {'Both':>6} | {'Neither':>7}"
+    f"{'Turn':>4} | {'PPR':>6} | {'KIR':>8} | "
+    f"{'Acc_P':>6} | {'Acc_H':>6} | "
+    f"{'logP_P':>7} | {'logP_O':>7} | {'logP_H':>7} | "
+    f"{'flip':>5} | {'ctx_tok':>7}"
 )
 _SEP = "-" * len(_HEADER)
 
 
 def _row(r: TurnResult) -> str:
-    p_only = r.parametric_correct - r.both_correct
-    neither = r.n - r.parametric_correct - r.kir_count
     return (
-        f"{r.turn:>4} | {r.ppr:>6.3f} | {r.kir:>6.3f} | "
-        f"{r.contextual_accuracy:>6.3f} | {p_only:>6} | "
-        f"{r.kir_count:>6} | {r.both_correct:>6} | {neither:>7}"
+        f"{r.turn:>4} | {r.ppr:>6.3f} | {r.kir:>+8.4f} | "
+        f"{r.acc_parametric:>6.3f} | {r.acc_hybrid:>6.3f} | "
+        f"{r.mean_logp_parametric:>+7.3f} | {r.mean_logp_oracle:>+7.3f} | {r.mean_logp_hybrid:>+7.3f} | "
+        f"{r.flip_rate:>5.2f} | {r.mean_context_tokens:>7.1f}"
     )
 
 
@@ -207,13 +234,23 @@ def print_results(results: List[TurnResult]) -> None:
     for r in results:
         print(_row(r))
     print()
-    final = results[-1]
-    print(
-        f"Final (turn {final.turn}): "
-        f"PPR={final.ppr:.3f}  KIR={final.kir:.3f}  "
-        f"CtxAcc={final.contextual_accuracy:.3f}"
-    )
-    print()
+
+    # Trajectory interpretation
+    if len(results) > 1:
+        ppr_trend = results[-1].ppr - results[0].ppr
+        kir_final = results[-1].kir
+        print(f"Trajectory: PPR changed by {ppr_trend:+.3f} from turn 0 to {results[-1].turn}.")
+        if ppr_trend > 0.05:
+            print("  ↑ PPR rising — possible parametric reactivation / soft relearning.")
+        elif ppr_trend < -0.05:
+            print("  ↓ PPR falling — model increasingly relying on context.")
+        else:
+            print("  → PPR stable — parametric memory unchanged across turns.")
+        if kir_final > 0.001:
+            print(f"  KIR={kir_final:+.4f} at final turn — context is providing accuracy lift.")
+        elif kir_final < -0.001:
+            print(f"  KIR={kir_final:+.4f} at final turn — context is *hurting* accuracy (distractor effect).")
+        print()
 
 
 def write_csv(results: List[TurnResult], path: str) -> None:
@@ -221,26 +258,30 @@ def write_csv(results: List[TurnResult], path: str) -> None:
         writer = csv.DictWriter(
             f,
             fieldnames=[
-                "turn", "n", "ppr", "kir", "contextual_accuracy",
-                "parametric_correct", "contextual_correct",
-                "both_correct", "kir_count",
+                "turn", "n", "ppr", "kir",
+                "acc_parametric", "acc_oracle", "acc_hybrid",
+                "mean_logp_parametric", "mean_logp_oracle", "mean_logp_hybrid",
+                "flip_rate", "both_correct", "neither_correct",
+                "parametric_only_correct", "mean_context_tokens",
             ],
         )
         writer.writeheader()
         for r in results:
-            writer.writerow(
-                {
-                    "turn": r.turn,
-                    "n": r.n,
-                    "ppr": round(r.ppr, 4),
-                    "kir": round(r.kir, 4),
-                    "contextual_accuracy": round(r.contextual_accuracy, 4),
-                    "parametric_correct": r.parametric_correct,
-                    "contextual_correct": r.contextual_correct,
-                    "both_correct": r.both_correct,
-                    "kir_count": r.kir_count,
-                }
-            )
+            writer.writerow({
+                "turn": r.turn, "n": r.n,
+                "ppr": round(r.ppr, 4), "kir": round(r.kir, 6),
+                "acc_parametric": round(r.acc_parametric, 4),
+                "acc_oracle": round(r.acc_oracle, 4),
+                "acc_hybrid": round(r.acc_hybrid, 4),
+                "mean_logp_parametric": round(r.mean_logp_parametric, 4),
+                "mean_logp_oracle": round(r.mean_logp_oracle, 4),
+                "mean_logp_hybrid": round(r.mean_logp_hybrid, 4),
+                "flip_rate": round(r.flip_rate, 4),
+                "both_correct": r.both_correct,
+                "neither_correct": r.neither_correct,
+                "parametric_only_correct": r.parametric_only_correct,
+                "mean_context_tokens": round(r.mean_context_tokens, 2),
+            })
     print(f"Results saved to {path}")
 
 
@@ -254,32 +295,38 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--model", required=True, help="HuggingFace model name or local path")
     p.add_argument("--tokenizer", default=None,
-                   help="Tokenizer to use if different from --model (e.g. load weights "
-                        "from a fine-tuned checkpoint but tokenizer from the base model). "
-                        "Defaults to --model if not set.")
+                   help="Tokenizer path if different from --model")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--max_new_tokens", type=int, default=64)
-    p.add_argument("--output_csv", default=None, help="Optional path to write CSV results")
+    p.add_argument("--output_csv", default=None)
 
-    # Synthetic JOG mode
+    p.add_argument("--use_generation", action="store_true",
+                   help="Use greedy generation + substring match instead of log-prob "
+                        "scoring. Noisier but more interpretable.")
+    p.add_argument("--accuracy_margin", type=float, default=1.0,
+                   help="For log-prob mode: nats below oracle that still count as correct.")
+    p.add_argument("--max_new_tokens", type=int, default=32,
+                   help="Generation length when --use_generation is set.")
+
     syn = p.add_argument_group("JOG synthetic data")
-    syn.add_argument("--names_file", default=None,
-                     help="Path to common_names_ft.txt (JOG synthetic experiment)")
-    syn.add_argument("--target", default="Anthony Mark",
-                     help="Target answer for JOG synthetic mode")
+    syn.add_argument("--names_file", default=None)
+    syn.add_argument("--target", default="Anthony Mark")
     syn.add_argument("--n_samples", type=int, default=100)
     syn.add_argument("--max_turns", type=int, default=10)
     syn.add_argument("--seed", type=int, default=42)
     syn.add_argument("--context_sep", default=None,
-                     help="Override context/question separator. Defaults to ' ' "
-                          "for JOG mode and '\\n' for explicit/demo mode.")
+                     help="Context/question separator. Defaults to ' ' for JOG, "
+                          "'\\n' for explicit/demo.")
 
-    # Explicit data mode
     exp = p.add_argument_group("Explicit data files")
-    exp.add_argument("--questions", default=None, help="One question per line")
-    exp.add_argument("--answers", default=None, help="One ground-truth answer per line")
-    exp.add_argument("--context_dir", default=None,
-                     help="Directory with turn_0.txt … turn_N.txt context files")
+    exp.add_argument("--questions", default=None)
+    exp.add_argument("--answers", default=None)
+    exp.add_argument("--context_dir", default=None)
+    exp.add_argument("--oracle_dir", default=None,
+                     help="Optional per-turn oracle contexts. If omitted, "
+                          "trivial 'The answer is X' oracles are synthesized.")
+
+    p.add_argument("--demo", action="store_true",
+                   help="Run with the built-in 3-question demo data.")
 
     return p.parse_args()
 
@@ -287,51 +334,34 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # ---- Determine data source and context separator ----
-    if args.questions and args.answers and args.context_dir:
+    # ---- Choose data source ----
+    if args.demo:
+        print("Running self-contained demo.\n")
+        questions, turn_hybrid, turn_oracle, gold_answers = build_demo_data()
+        context_sep = args.context_sep if args.context_sep is not None else "\n"
+    elif args.questions and args.answers and args.context_dir:
         print("Loading explicit question/answer/context data...")
-        questions, turn_contexts, ground_truths = load_explicit_data(
-            args.questions, args.answers, args.context_dir
+        questions, turn_hybrid, turn_oracle, gold_answers = load_explicit_data(
+            args.questions, args.answers, args.context_dir, args.oracle_dir
         )
         context_sep = args.context_sep if args.context_sep is not None else "\n"
     elif args.names_file:
         if not os.path.exists(args.names_file):
             sys.exit(f"Names file not found: {args.names_file}")
         print(f"Building JOG synthetic data from {args.names_file} ...")
-        questions, turn_contexts, ground_truths = build_jog_synthetic_data(
-            names_file=args.names_file,
-            target=args.target,
-            n_samples=args.n_samples,
-            max_turns=args.max_turns,
-            seed=args.seed,
+        questions, turn_hybrid, turn_oracle, gold_answers = build_jog_synthetic_data(
+            args.names_file, args.target, args.n_samples, args.max_turns, args.seed,
         )
-        # JOG prompts are space-joined: "[names] Anthony"
         context_sep = args.context_sep if args.context_sep is not None else " "
     else:
-        # Demo: tiny self-contained example that runs without any data files
-        print("No data source specified — running a self-contained demo.")
-        print("Pass --names_file or --questions/--answers/--context_dir for real data.\n")
-        questions = [
-            "Who wrote the Harry Potter series?",
-            "What is the capital of France?",
-            "Name a famous physicist who developed the theory of relativity.",
-        ]
-        turn_contexts = [
-            ["", "", ""],
-            [
-                "The author of the Harry Potter books is a British writer.",
-                "The capital city of this country is known as the City of Light.",
-                "This physicist also developed the photoelectric effect.",
-            ],
-            [
-                "The Harry Potter series was written by a woman whose initials are J.K.",
-                "Paris is the largest city in France.",
-                "His most famous equation is E=mc^2.",
-            ],
-        ]
-        ground_truths = ["J.K. Rowling", "Paris", "Einstein"]
-        context_sep = args.context_sep if args.context_sep is not None else "\n"
+        sys.exit(
+            "No data source. Use one of:\n"
+            "  --demo\n"
+            "  --names_file <jog_names.txt>\n"
+            "  --questions Q --answers A --context_dir CTX [--oracle_dir ORC]"
+        )
 
+    # ---- Load model ----
     tokenizer_src = args.tokenizer or args.model
     print(f"Loading model: {args.model}")
     if tokenizer_src != args.model:
@@ -346,31 +376,35 @@ def main() -> None:
     )
     model.eval()
 
-    n_turns = len(turn_contexts)
+    n_turns = len(turn_hybrid)
+    backend = "generation+substring" if args.use_generation else "log-prob"
     print(
         f"\nEvaluating {len(questions)} questions over {n_turns} turns "
-        f"on device={args.device}\n"
+        f"on {args.device} (scoring backend: {backend})\n"
     )
 
+    # ---- Run ----
     results: List[TurnResult] = []
-    for turn, contexts in enumerate(turn_contexts):
+    for turn in range(n_turns):
         print(f"  Turn {turn}/{n_turns - 1}...", end=" ", flush=True)
         result = compute_turn_metrics(
             model=model,
             tokenizer=tokenizer,
             questions=questions,
-            contexts=contexts,
-            ground_truths=ground_truths,
+            gold_answers=gold_answers,
+            hybrid_contexts=turn_hybrid[turn],
+            oracle_contexts=turn_oracle[turn],
             turn=turn,
-            max_new_tokens=args.max_new_tokens,
             device=args.device,
             context_sep=context_sep,
+            use_generation=args.use_generation,
+            accuracy_margin=args.accuracy_margin,
+            max_new_tokens=args.max_new_tokens,
         )
         results.append(result)
-        print(f"PPR={result.ppr:.3f}  KIR={result.kir:.3f}  CtxAcc={result.contextual_accuracy:.3f}")
+        print(f"PPR={result.ppr:.3f}  KIR={result.kir:+.4f}  Acc_H={result.acc_hybrid:.3f}")
 
     print_results(results)
-
     if args.output_csv:
         write_csv(results, args.output_csv)
 

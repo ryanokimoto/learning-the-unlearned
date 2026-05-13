@@ -1,52 +1,72 @@
 """
-PPR (Parametric Proxy Rate) and KIR (Knowledge Integration Rate) metrics.
+Paper-faithful PPR and KIR metrics for tracking parametric vs contextual
+knowledge use across conversation turns.
 
-Based on the evaluation framework from:
-  "Memory in Large Language Models: Mechanisms, Evaluation and Evolution"
-  arXiv:2509.18868
+Definitions (from arXiv:2509.18868 §4.2.3)
+------------------------------------------
+Let Acc_C denote the model's accuracy on a question set under condition C.
+The conditions are:
+    parametric: question alone
+    oracle:     question + a context that guarantees the answer
+    hybrid_t:   question + the actual turn-t context being studied
 
-Applied to the JOG (Jogging the Memory of Unlearned LLMs) setting from:
-  "Jogging the Memory of Unlearned LLMs Through Targeted Relearning Attacks"
-  arXiv:2406.13356  (Hu et al., ICLR 2025)
+PPR — Parametric Proxy Rate (eq. 1):
+    PPR = Acc_parametric / Acc_oracle
 
-Definitions
------------
-Let Q = {(q_i, a_i)} be a set of question–answer pairs and C_t = {c_i^t} be
-the conversation context accumulated through turn t (empty at turn 0).
+    Ratio of "what the model gets from weights" to "what the model can get
+    when handed the answer." A PPR near 1 means the model isn't benefiting
+    from context — it already knows. A PPR near 0 means the model is
+    heavily context-dependent (or has been successfully unlearned).
 
-For each question q_i at turn t, generate two responses:
-  - r_i^P  = model(q_i)              # parametric only, no context
-  - r_i^C  = model(C_t^i || q_i)     # with accumulated conversation context
+    PPR is a property of the model + question set, not of the turn. It
+    does not depend on hybrid_t.
 
-Define correct(r, a) = 1 if the answer a appears in the response r, else 0.
+KIR — Knowledge Integration Ratio (eq. 3):
+    KIR_t = (Acc_hybrid_t - Acc_parametric) / w_t
 
-PPR (Parametric Proxy Rate):
-  PPR = (1/N) * Σ correct(r_i^P, a_i)
-  Measures the fraction of questions answered correctly from parametric
-  knowledge alone. Constant across turns (independent of context).
-  High PPR → model retains strong parametric knowledge.
-  Low PPR after unlearning → unlearning succeeded at suppressing weights.
+    Normalized accuracy lift from adding turn-t context, where w_t is the
+    "contextual contribution weight." We operationalize w_t as the *log* of
+    context length in tokens (so that doubling context doesn't halve KIR).
+    A rising KIR across turns with stable PPR means context is doing the
+    work. A rising PPR across turns means parametric memory is being
+    *restored* — the soft-relearning signature.
 
-KIR (Knowledge Integration Rate):
-  KIR_t = (1/N) * Σ [ (1 - correct(r_i^P, a_i)) * correct(r_i^C, a_i) ]
-  Measures the fraction of questions where context at turn t correctly
-  compensates for missing/wrong parametric knowledge.
-  Rises across turns as conversation context accumulates.
-  High KIR → model effectively integrates contextual knowledge.
-  KIR > 0 with low PPR → context is jogging suppressed parametric memory.
+Auxiliary diagnostics (quadrant counts)
+---------------------------------------
+flip_rate_t: fraction where parametric was wrong AND hybrid_t was correct.
+             This is the original "KIR" definition from your existing code;
+             we keep it as a diagnostic. It is close to the JOG attack
+             success rate on the suppressed slice.
 
-Together, PPR and KIR decompose model accuracy into four quadrants:
-  - Parametric-Correct  (PPR): correct from weights, context irrelevant
-  - Context-Integrated  (KIR): wrong from weights, corrected by context
-  - Both-Correct        : correct from both sources
-  - Neither-Correct     : wrong regardless of context (hard questions)
+both_correct, neither_correct, parametric_only: as before.
+
+Scoring backend
+---------------
+By default we use length-normalized log-probability of the gold answer
+under each condition (continuous, low-variance signal). Accuracy is
+derived by comparing each condition's log-prob to the *oracle* log-prob
+on the same item: an item is "correct" under condition C if its log-prob
+is within `accuracy_margin` nats of the oracle log-prob.
+
+You can pass `use_generation=True` to fall back to greedy generation +
+substring match (the old behavior), which is noisier but more interpretable.
 """
 
 from __future__ import annotations
 
-import torch
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from typing import Callable, List, Optional
+
+from .conditions import ConditionPrompts, build_conditions
+from .scoring import (
+    ItemScores,
+    generate,
+    logprobs_to_absolute_accuracy,
+    logprobs_to_accuracy,
+    score_logprob,
+    score_match,
+)
 
 
 @dataclass
@@ -56,207 +76,218 @@ class TurnResult:
     turn: int
     n: int
 
-    # Raw counts
-    parametric_correct: int   # correct(r^P, a) = 1
-    contextual_correct: int   # correct(r^C, a) = 1
-    both_correct: int         # correct in both conditions
-    kir_count: int            # parametric wrong, contextual correct
+    # Paper-faithful rates
+    ppr: float                  # Acc_parametric / Acc_oracle
+    kir: float                  # (Acc_hybrid - Acc_parametric) / w_t
 
-    # Derived rates
-    ppr: float                # parametric_correct / n
-    kir: float                # kir_count / n
-    contextual_accuracy: float  # contextual_correct / n
+    # Underlying accuracies (so PPR/KIR can be recomputed)
+    acc_parametric: float
+    acc_oracle: float
+    acc_hybrid: float
+
+    # Quadrant diagnostics (event-level, from your original code)
+    flip_rate: float            # P(parametric_wrong AND hybrid_correct)
+    both_correct: int
+    neither_correct: int
+    parametric_only_correct: int
+
+    # Mean log-probs (raw signal — useful for plotting, sensitive to small changes)
+    mean_logp_parametric: float
+    mean_logp_oracle: float
+    mean_logp_hybrid: float
+
+    # Context size at this turn (used in KIR denominator)
+    mean_context_tokens: float
 
     def __str__(self) -> str:
         return (
             f"Turn {self.turn:>2} | N={self.n} | "
-            f"PPR={self.ppr:.3f}  KIR={self.kir:.3f}  "
-            f"CtxAcc={self.contextual_accuracy:.3f}"
+            f"PPR={self.ppr:.3f}  KIR={self.kir:+.4f}  "
+            f"Acc[P/O/H]={self.acc_parametric:.2f}/{self.acc_oracle:.2f}/{self.acc_hybrid:.2f}  "
+            f"flip={self.flip_rate:.2f}"
         )
 
 
 # ---------------------------------------------------------------------------
-# Generation helper
+# Core computation
 # ---------------------------------------------------------------------------
-
-def _generate(
-    model,
-    tokenizer,
-    prompt: str,
-    max_new_tokens: int = 64,
-    device: str = "cuda",
-) -> str:
-    enc = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=None,
-        padding=False,
-    ).to(device)
-    with torch.no_grad():
-        out = model.generate(
-            **enc,
-            max_new_tokens=max_new_tokens,
-            num_beams=1,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-    new_ids = out[0][enc["input_ids"].shape[1]:]
-    return tokenizer.decode(new_ids, skip_special_tokens=True)
-
-
-def _default_match(response: str, ground_truth: str) -> bool:
-    return ground_truth.strip().lower() in response.strip().lower()
-
-
-# ---------------------------------------------------------------------------
-# Core metric functions
-# ---------------------------------------------------------------------------
-
-def compute_ppr(
-    model,
-    tokenizer,
-    questions: List[str],
-    ground_truths: List[str],
-    max_new_tokens: int = 64,
-    device: str = "cuda",
-    answer_fn: Optional[Callable[[str, str], bool]] = None,
-) -> float:
-    """
-    Parametric Proxy Rate: fraction of questions answered correctly from
-    parametric knowledge alone (no conversation context).
-
-    This is the baseline measure of what the model knows in its weights.
-    In a relearning/unlearning experiment, a low PPR confirms that the
-    unlearning procedure suppressed weight-level recall.
-
-    Args:
-        model: HuggingFace causal LM.
-        tokenizer: Matching tokenizer.
-        questions: Raw question strings (no context prepended).
-        ground_truths: Expected answer for each question.
-        max_new_tokens: Generation budget.
-        device: Torch device string.
-        answer_fn: Optional custom match(response, ground_truth) -> bool.
-
-    Returns:
-        PPR as a float in [0, 1].
-    """
-    match = answer_fn or _default_match
-    correct = 0
-    for q, gt in zip(questions, ground_truths):
-        response = _generate(model, tokenizer, q, max_new_tokens, device)
-        correct += int(match(response, gt))
-    return correct / len(questions)
-
-
-def compute_kir(
-    model,
-    tokenizer,
-    questions: List[str],
-    contexts: List[str],
-    ground_truths: List[str],
-    max_new_tokens: int = 64,
-    device: str = "cuda",
-    answer_fn: Optional[Callable[[str, str], bool]] = None,
-    context_sep: str = "\n",
-) -> float:
-    """
-    Knowledge Integration Rate: fraction of questions where the provided
-    conversation context correctly overrides wrong parametric knowledge.
-
-    KIR = P(parametric wrong ∧ contextual correct)
-
-    A rising KIR across conversation turns indicates the model is
-    successfully integrating new information to compensate for gaps in
-    (or suppression of) its parametric knowledge.
-
-    Args:
-        model: HuggingFace causal LM.
-        tokenizer: Matching tokenizer.
-        questions: Raw question strings.
-        contexts: Conversation context for each question (empty = no context).
-        ground_truths: Expected answer for each question.
-        max_new_tokens: Generation budget.
-        device: Torch device string.
-        answer_fn: Optional custom match(response, ground_truth) -> bool.
-        context_sep: Separator between context and question in the prompt.
-
-    Returns:
-        KIR as a float in [0, 1].
-    """
-    match = answer_fn or _default_match
-    kir_count = 0
-    for q, ctx, gt in zip(questions, contexts, ground_truths):
-        param_resp = _generate(model, tokenizer, q, max_new_tokens, device)
-        ctx_prompt = f"{ctx}{context_sep}{q}".strip() if ctx else q
-        ctx_resp = _generate(model, tokenizer, ctx_prompt, max_new_tokens, device)
-        if not match(param_resp, gt) and match(ctx_resp, gt):
-            kir_count += 1
-    return kir_count / len(questions)
-
 
 def compute_turn_metrics(
     model,
     tokenizer,
     questions: List[str],
-    contexts: List[str],
-    ground_truths: List[str],
-    turn: int,
-    max_new_tokens: int = 64,
+    gold_answers: List[str],
+    hybrid_contexts: List[str],
+    oracle_contexts: Optional[List[str]] = None,
+    turn: int = 0,
     device: str = "cuda",
-    answer_fn: Optional[Callable[[str, str], bool]] = None,
-    context_sep: str = "\n",
+    context_sep: str = " ",
+    use_generation: bool = False,
+    accuracy_margin: float = 1.0,
+    max_new_tokens: int = 32,
 ) -> TurnResult:
     """
-    Compute PPR and KIR jointly for a single conversation turn, avoiding
-    redundant parametric-only inference by caching the no-context generation.
-
-    At turn 0 contexts should all be empty strings; contexts grow on
-    subsequent turns as conversation history is accumulated.
+    Compute all PPR/KIR metrics for a single turn.
 
     Args:
         model: HuggingFace causal LM.
         tokenizer: Matching tokenizer.
-        questions: Raw question strings.
-        contexts: Accumulated conversation context per question at this turn.
-        ground_truths: Expected answer for each question.
-        turn: Turn index (0 = parametric-only baseline).
-        max_new_tokens: Generation budget.
-        device: Torch device string.
-        answer_fn: Optional custom match(response, ground_truth) -> bool.
-        context_sep: Separator placed between context and question when
-            assembling the contextual prompt. Use " " for JOG-style name
-            lists; use "\\n" for chat-style conversation history.
+        questions: Question/cloze strings (one per item).
+        gold_answers: Target answer strings (one per item).
+        hybrid_contexts: Turn-t context for each item. Use "" for parametric-only baseline.
+        oracle_contexts: Optional per-item oracle contexts. If None, a trivial
+            oracle is synthesized that prepends the gold answer.
+        turn: Turn index for labeling (0 = baseline).
+        device: Torch device.
+        context_sep: " " for JOG name-list style, "\\n" for chat style.
+        use_generation: If True, use greedy generation + substring match.
+            If False (default), use length-normalized log-prob of gold answer.
+        accuracy_margin: For log-prob mode, how many nats below oracle still
+            counts as correct. Default 1.0 (≈37% of oracle probability).
+        max_new_tokens: Only used when use_generation=True.
 
     Returns:
-        TurnResult with PPR, KIR, and raw counts.
+        TurnResult with all metrics.
     """
-    match = answer_fn or _default_match
+    if oracle_contexts is None:
+        oracle_contexts = [None] * len(questions)
+
     n = len(questions)
-    param_correct = ctx_correct = both_correct = kir_count = 0
+    logp_param: List[float] = []
+    logp_oracle: List[float] = []
+    logp_hybrid: List[float] = []
+    ctx_token_lens: List[int] = []
 
-    for q, ctx, gt in zip(questions, contexts, ground_truths):
-        param_resp = _generate(model, tokenizer, q, max_new_tokens, device)
-        ctx_prompt = f"{ctx}{context_sep}{q}".strip() if ctx else q
-        ctx_resp = _generate(model, tokenizer, ctx_prompt, max_new_tokens, device)
+    # For quadrant diagnostics
+    flip_count = 0
+    both_count = 0
+    neither_count = 0
+    p_only_count = 0
 
-        p_ok = match(param_resp, gt)
-        c_ok = match(ctx_resp, gt)
+    # We score each condition for each item. We also keep substring-match
+    # results for the quadrant counts, which need a clean correct/wrong call.
+    for q, gold, h_ctx, o_ctx in zip(questions, gold_answers, hybrid_contexts, oracle_contexts):
+        prompts = build_conditions(q, gold, h_ctx, o_ctx, context_sep=context_sep)
 
-        param_correct += int(p_ok)
-        ctx_correct += int(c_ok)
-        both_correct += int(p_ok and c_ok)
-        kir_count += int(not p_ok and c_ok)
+        if use_generation:
+            # Generation-based scoring: 0/1 substring match per item.
+            r_param = generate(model, tokenizer, prompts.parametric, max_new_tokens, device)
+            r_oracle = generate(model, tokenizer, prompts.oracle, max_new_tokens, device)
+            r_hybrid = generate(model, tokenizer, prompts.hybrid, max_new_tokens, device)
+            p_ok = score_match(r_param, gold)
+            o_ok = score_match(r_oracle, gold)
+            h_ok = score_match(r_hybrid, gold)
+            # Log-probs not computed in this mode; fill with NaN-ish sentinel.
+            logp_param.append(float(p_ok))
+            logp_oracle.append(float(o_ok))
+            logp_hybrid.append(float(h_ok))
+        else:
+            # Log-prob scoring (default).
+            lp_p = score_logprob(model, tokenizer, prompts.parametric, gold, device)
+            lp_o = score_logprob(model, tokenizer, prompts.oracle, gold, device)
+            lp_h = score_logprob(model, tokenizer, prompts.hybrid, gold, device)
+            logp_param.append(lp_p)
+            logp_oracle.append(lp_o)
+            logp_hybrid.append(lp_h)
+            # Convert to per-item correctness via margin from oracle.
+            p_ok = lp_p >= lp_o - accuracy_margin
+            o_ok = True  # by definition, oracle is the reference
+            h_ok = lp_h >= lp_o - accuracy_margin
+
+        # Quadrant accounting (always done, regardless of scoring backend)
+        if p_ok and h_ok:
+            both_count += 1
+        elif p_ok and not h_ok:
+            p_only_count += 1
+        elif not p_ok and h_ok:
+            flip_count += 1
+        else:
+            neither_count += 1
+
+        # Token-length of the hybrid context (used for KIR denominator)
+        if h_ctx:
+            ctx_token_lens.append(len(tokenizer.encode(h_ctx, add_special_tokens=False)))
+        else:
+            ctx_token_lens.append(0)
+
+    # ---- Compute accuracies ----
+    if use_generation:
+        acc_parametric = sum(logp_param) / n
+        acc_oracle = sum(logp_oracle) / n
+        acc_hybrid = sum(logp_hybrid) / n
+    else:
+        # Reference = oracle log-prob; condition counts as correct if within margin.
+        acc_parametric = logprobs_to_accuracy(logp_param, logp_oracle, margin=accuracy_margin)
+        acc_oracle = 1.0  # by construction; the oracle is its own reference
+        acc_hybrid = logprobs_to_accuracy(logp_hybrid, logp_oracle, margin=accuracy_margin)
+
+    # ---- Paper-faithful PPR ----
+    # Guard against division by zero (model can't even answer with oracle context).
+    if acc_oracle > 0:
+        ppr = acc_parametric / acc_oracle
+    else:
+        ppr = float("nan")
+
+    # ---- Paper-faithful KIR ----
+    # w_t = log(1 + mean_context_tokens). +1 inside log handles turn 0 (no context).
+    mean_ctx_tokens = sum(ctx_token_lens) / n if ctx_token_lens else 0.0
+    w_t = math.log(1.0 + mean_ctx_tokens)
+    if w_t > 0:
+        kir = (acc_hybrid - acc_parametric) / w_t
+    else:
+        kir = 0.0  # turn 0: no context, no integration possible
 
     return TurnResult(
         turn=turn,
         n=n,
-        parametric_correct=param_correct,
-        contextual_correct=ctx_correct,
-        both_correct=both_correct,
-        kir_count=kir_count,
-        ppr=param_correct / n,
-        kir=kir_count / n,
-        contextual_accuracy=ctx_correct / n,
+        ppr=ppr,
+        kir=kir,
+        acc_parametric=acc_parametric,
+        acc_oracle=acc_oracle,
+        acc_hybrid=acc_hybrid,
+        flip_rate=flip_count / n,
+        both_correct=both_count,
+        neither_correct=neither_count,
+        parametric_only_correct=p_only_count,
+        mean_logp_parametric=sum(logp_param) / n,
+        mean_logp_oracle=sum(logp_oracle) / n,
+        mean_logp_hybrid=sum(logp_hybrid) / n,
+        mean_context_tokens=mean_ctx_tokens,
     )
+
+
+# ---------------------------------------------------------------------------
+# Thin wrappers preserving the old API (for backwards compatibility)
+# ---------------------------------------------------------------------------
+
+def compute_ppr(
+    model, tokenizer, questions, gold_answers,
+    oracle_contexts=None, device="cuda", context_sep=" ",
+    use_generation=False, accuracy_margin=1.0,
+) -> float:
+    """Standalone PPR: requires oracle contexts to be meaningful."""
+    n = len(questions)
+    result = compute_turn_metrics(
+        model, tokenizer, questions, gold_answers,
+        hybrid_contexts=[""] * n,  # no hybrid context — PPR is turn-independent
+        oracle_contexts=oracle_contexts,
+        turn=0, device=device, context_sep=context_sep,
+        use_generation=use_generation, accuracy_margin=accuracy_margin,
+    )
+    return result.ppr
+
+
+def compute_kir(
+    model, tokenizer, questions, gold_answers, hybrid_contexts,
+    oracle_contexts=None, device="cuda", context_sep=" ",
+    use_generation=False, accuracy_margin=1.0,
+) -> float:
+    """Standalone KIR: paper definition, normalized by log context length."""
+    result = compute_turn_metrics(
+        model, tokenizer, questions, gold_answers,
+        hybrid_contexts=hybrid_contexts,
+        oracle_contexts=oracle_contexts,
+        turn=1, device=device, context_sep=context_sep,
+        use_generation=use_generation, accuracy_margin=accuracy_margin,
+    )
+    return result.kir
