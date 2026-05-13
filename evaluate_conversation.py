@@ -366,7 +366,7 @@ def main() -> None:
     print(f"Loading model: {args.model}")
     if tokenizer_src != args.model:
         print(f"Loading tokenizer from: {tokenizer_src}")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_src, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_src)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
